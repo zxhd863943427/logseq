@@ -1,0 +1,140 @@
+name: Build Desktop Release (Windows and Linux)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 14 * * MON-FRI'
+
+env:
+  NODE_VERSION: '16'
+
+jobs:
+
+  compile-cljs:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+
+    - name: Install deps
+      run: yarn
+
+    - name: Compile CLJS
+      run: yarn build
+
+    - name: Prepare static files
+      run: |
+        cp -r dist static
+        echo "0.1.0" > static/VERSION 
+
+    - name: Upload static files
+      uses: actions/upload-artifact@v3
+      with:
+        name: static
+        path: static
+
+  build-linux:
+
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Download static files
+      uses: actions/download-artifact@v3
+      with:
+        name: static
+        path: static
+
+    - name: Install Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+
+    - name: Install deps
+      run: yarn
+
+    - name: Build AppImage
+      run: yarn build:linux
+
+    - name: Prepare artifact
+      run: |
+        mkdir builds
+        cp dist/linux/*.AppImage builds/
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: logseq-linux-build
+        path: builds
+
+  build-windows:
+
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Download static files  
+      uses: actions/download-artifact@v3
+      with:
+        name: static
+        path: static
+
+    - name: Install Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+
+    - name: Install deps  
+      run: yarn
+
+    - name: Build Windows installer
+      run: yarn build:win
+
+    - name: Prepare artifact
+      run: |
+        mkdir builds
+        cp dist/win/*.exe builds/
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: logseq-win-build
+        path: builds
+
+  release:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Download Linux artifact
+      uses: actions/download-artifact@v3
+      with:
+        name: logseq-linux-build
+        path: ./
+
+    - name: Download Windows artifact
+      uses: actions/download-artifact@v3
+      with:
+        name: logseq-win-build
+        path: ./
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: v0.1.0
+        name: Release v0.1.0
+        draft: false
+        prerelease: false
+        files: |
+          *.AppImage
+          *.exe
