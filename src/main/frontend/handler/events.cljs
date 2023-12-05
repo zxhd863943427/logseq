@@ -23,7 +23,7 @@
             [frontend.components.whiteboard :as whiteboard]
             [frontend.components.user.login :as login]
             [frontend.components.repo :as repo]
-            [frontend.components.page :as page]
+            [frontend.components.db-based.page :as db-page]
             [frontend.config :as config]
             [frontend.context.i18n :refer [t]]
             [frontend.db :as db]
@@ -79,7 +79,7 @@
 
 (defmulti handle first)
 
-(defn- file-sync-restart! []
+(defn file-sync-restart! []
   (async/go (async/<! (p->c (persist-var/load-vars)))
             (async/<! (sync/<sync-stop))
             (some-> (sync/<sync-start) async/<!)))
@@ -139,7 +139,7 @@
     (if empty-graph?
       (route-handler/redirect! {:to :import :query-params {:from "picker"}})
       (route-handler/redirect-to-home!)))
-  (when-let [dir-name (config/get-repo-dir repo)]
+  (when-let [dir-name (and (not (config/db-based-graph? repo)) (config/get-repo-dir repo))]
     (fs/watch-dir! dir-name))
   (file-sync-restart!))
 
@@ -168,7 +168,7 @@
        (srs/update-cards-due-count!)
        (state/pub-event! [:graph/ready graph])
        (file-sync-restart!)
-       (when-let [dir-name (config/get-repo-dir graph)]
+       (when-let [dir-name (and (not (config/db-based-graph? graph)) (config/get-repo-dir graph))]
          (fs/watch-dir! dir-name))))))
 
 ;; Parameters for the `persist-db` function, to show the notification messages
@@ -253,20 +253,6 @@
 
 (defmethod handle :graph/migrated [[_ _repo]]
   (js/alert "Graph migrated."))
-
-(defmethod handle :graph/save [_]
-  (repo-handler/persist-db! (state/get-current-repo)
-                            {:before     #(notification/show!
-                                           (ui/loading (t :graph/save))
-                                           :warning)
-                             :on-success #(do
-                                            (notification/clear-all!)
-                                            (notification/show!
-                                             (t :graph/save-success)
-                                             :success))
-                             :on-error   #(notification/show!
-                                           (t :graph/save-error)
-                                           :error)}))
 
 (defn get-local-repo
   []
@@ -675,37 +661,6 @@
                                    r))
                             (state/get-repos)))))))
 
-(defmethod handle :graph/re-index [[_]]
-  ;; Ensure the graph only has ONE window instance
-  (async/go
-    (async/<! (sync/<sync-stop))
-    (repo-handler/re-index!
-     nfs-handler/rebuild-index!
-     #(do (page-handler/create-today-journal!)
-          (file-sync-restart!)))))
-
-(defmethod handle :graph/ask-for-re-index [[_ *multiple-windows? ui]]
-  ;; *multiple-windows? - if the graph is opened in multiple windows, boolean atom
-  ;; ui - custom message to show on asking for re-index
-  (if (and (util/atom? *multiple-windows?) @*multiple-windows?)
-    (handle
-     [:modal/show
-      [:div
-       (when (not (nil? ui)) ui)
-       [:p (t :re-index-multiple-windows-warning)]]])
-    (handle
-     [:modal/show
-      [:div {:style {:max-width 700}}
-       (when (not (nil? ui)) ui)
-       [:p (t :re-index-discard-unsaved-changes-warning)]
-       (ui/button
-         (t :yes)
-         :autoFocus "on"
-         :class "ui__modal-enter"
-         :on-click (fn []
-                     (state/close-modal!)
-                     (state/pub-event! [:graph/re-index])))]])))
-
 (defmethod handle :modal/remote-encryption-input-pw-dialog [[_ repo-url remote-graph-info type opts]]
   (state/set-modal!
    (encryption/input-password
@@ -877,7 +832,7 @@
   (state/set-modal!
    #(vector :<>
             (class-component/configure page)
-            (page/page-properties page {:configure? true}))
+            (db-page/page-properties page {:configure? true}))
    {:id :page-configure
     :label "page-configure"
     :container-overflow-visible? true}))

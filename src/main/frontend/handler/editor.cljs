@@ -550,7 +550,7 @@
                             (wrap-parse-block)
                             (assoc :block/uuid (or custom-uuid (db/new-block-id))))
               new-block (if (and db-based? (seq properties))
-                          (assoc new-block :block/properties (db-property-handler/replace-key-with-id! properties))
+                          (assoc new-block :block/properties (db-property-handler/replace-key-with-id properties))
                           new-block)
               new-block (merge new-block other-attrs)
               [block-m sibling?] (cond
@@ -1431,7 +1431,8 @@
   "Make asset URL for UI element, to fill img.src"
   [path] ;; path start with "/assets"(editor) or compatible for "../assets"(whiteboards)
   (if config/publishing?
-    path
+    ;; Relative path needed since assets are not under '/' if published graph is not under '/'
+    (string/replace-first path #"^/" "")
     (let [repo      (state/get-current-repo)
           repo-dir  (config/get-repo-dir repo)
           ;; Hack for path calculation
@@ -1447,15 +1448,15 @@
         (assets-handler/resolve-asset-real-path-url (state/get-current-repo) path)
 
         (util/electron?)
-        (path/path-join "assets://" full-path)
+        (path/prepend-protocol "assets:" full-path)
 
         (mobile-util/native-platform?)
         (mobile-util/convert-file-src full-path)
 
         (config/db-based-graph? (state/get-current-repo)) ; memory fs
         (p/let [binary (fs/read-file repo-dir path {})
-                blob (js/Blob. (array binary) (clj->js {:type "image"}))]
-          (when blob (js/URL.createObjectURL blob)))
+                 blob (js/Blob. (array binary) (clj->js {:type "image"}))]
+           (when blob (js/URL.createObjectURL blob)))
 
         :else ;; nfs
         (let [handle-path (str "handle/" full-path)
@@ -1628,11 +1629,19 @@
         editing-page (and block
                           (when-let [page-id (:db/id (:block/page block))]
                             (:block/name (db/entity page-id))))
-        pages (search/page-search q 100)]
+        pages (search/page-search q)]
     (if editing-page
       ;; To prevent self references
       (remove (fn [p] (= (util/page-name-sanity-lc p) editing-page)) pages)
       pages)))
+
+(comment
+  (defn get-matched-classes
+   "Return matched class names"
+   [q]
+   (let [classes (->> (db-model/get-all-classes (state/get-current-repo))
+                      (map first))]
+     (search/fuzzy-search classes q {:limit 100}))))
 
 (defn get-matched-blocks
   [q block-id]
@@ -3659,7 +3668,7 @@
     (->> (all-blocks-with-level {:page page
                                  :collapse? true})
          (map (fn [b] (or (some-> (:db/id (:block/link b)) db/entity) b)))
-         (map (comp gdom/getElementByClass str :block/uuid))
+         (map (comp gdom/getElementByClass (fn [b] (str "id" (:block/uuid b)))))
          state/exit-editing-and-set-selected-blocks!))
   (state/set-state! :selection/selected-all? true))
 
@@ -3674,7 +3683,7 @@
       (do
         (util/stop e)
         (state/exit-editing-and-set-selected-blocks!
-         [(gdom/getElementByClass (str (:block/uuid edit-block)))]))
+         [(gdom/getElementByClass (str "id" (:block/uuid edit-block)))]))
 
       edit-block
       nil
@@ -3702,7 +3711,7 @@
                   nil
 
                   (and parent (:block/parent parent))
-                  (state/exit-editing-and-set-selected-blocks! [(gdom/getElementByClass (:block/uuid parent))])
+                  (state/exit-editing-and-set-selected-blocks! [(gdom/getElementByClass (str "id" (:block/uuid parent)))])
 
                   (:block/name parent)
                   ;; page block

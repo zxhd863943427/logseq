@@ -9,13 +9,14 @@
             [electron.ipc :as ipc]
             [frontend.colors :as colors]
             [frontend.mobile.util :as mobile-util]
-            [frontend.storage :as storage]
             [frontend.spec.storage :as storage-spec]
+            [frontend.storage :as storage]
             [frontend.util :as util]
             [frontend.util.cursor :as cursor]
             [goog.dom :as gdom]
             [goog.object :as gobj]
             [logseq.graph-parser.config :as gp-config]
+            [malli.core :as m]
             [medley.core :as medley]
             [promesa.core :as p]
             [rum.core :as rum]))
@@ -35,7 +36,12 @@
      {:route-match                           nil
       :today                                 nil
       :system/events                         (async/chan 1000)
-      :file/writes                           (async/chan 10000)
+      :file/writes                           (let [coercer (m/coercer [:catn
+                                                                       [:repo :string]
+                                                                       [:page-id :any]
+                                                                       [:outliner-op :any]
+                                                                       [:epoch :int]])]
+                                               (async/chan 10000 (map coercer)))
       :file/unlinked-dirs                    #{}
       :reactive/custom-queries               (async/chan 1000)
       :notification/show?                    false
@@ -44,7 +50,7 @@
       :nfs/user-granted?                     {}
       :nfs/refreshing?                       nil
       :instrument/disabled?                  (storage/get "instrument-disabled")
-      ;; TODO: how to detect the network reliably?
+     ;; TODO: how to detect the network reliably?
       :network/online?         true
       :indexeddb/support?      true
       :me                      nil
@@ -285,6 +291,9 @@
       ;;                :file-sync/last-synced-at {}}
       :file-sync/graph-state                 {:current-graph-uuid nil}
       ;; graph-uuid -> ...
+
+      ;; graph-url -> {:in-transaction? Boolean :txs []}
+      :rtc/remote-batch-tx-state             {}
 
       :user/info                             {:UserGroups (storage/get :user-groups)}
       :encryption/graph-parsing?             false

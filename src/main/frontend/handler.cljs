@@ -22,6 +22,7 @@
             [frontend.extensions.srs :as srs]
             [frontend.handler.command-palette :as command-palette]
             [frontend.handler.events :as events]
+            [frontend.handler.file-based.events]
             [frontend.handler.file :as file-handler]
             [frontend.handler.global-config :as global-config-handler]
             [frontend.handler.notification :as notification]
@@ -52,17 +53,11 @@
 
 (defn- set-global-error-notification!
   []
-  (set! js/window.onerror
-        (fn [message, _source, _lineno, _colno, error]
-          (when-not (error/ignored? message)
-            (log/error :exception error)))))
-            ;; (notification/show!
-            ;;  (str "message=" message "\nsource=" source "\nlineno=" lineno "\ncolno=" colno "\nerror=" error)
-            ;;  :error
-            ;;  ;; Don't auto-hide
-            ;;  false)
-            
-
+  (when-not config/dev?
+    (set! js/window.onerror
+          (fn [message, _source, _lineno, _colno, error]
+            (when-not (error/ignored? message)
+              (log/error :exception error))))))
 
 (defn- watch-for-date!
   []

@@ -15,12 +15,13 @@
         ["logseq.db.sqlite." "logseq.db.frontend.property" "logseq.db.frontend.malli-schema"
          "electron.db"
          "frontend.handler.db-based."
-         "frontend.components.property" "frontend.components.class"]))
+         "frontend.components.property" "frontend.components.class" "frontend.components.db-based"]))
 
 (def file-graph-ns
   "Namespaces or parent namespaces _only_ for file graphs"
   (mapv escape-shell-regex
         ["frontend.handler.file-based" "frontend.handler.conversion" "frontend.handler.file-sync"
+         "frontend.db.file-based"
          "frontend.fs"
          "frontend.components.conversion" "frontend.components.file-sync"
          "frontend.util.fs"
@@ -31,11 +32,14 @@
   ["src/main/frontend/handler/db_based"
    "src/main/frontend/components/class.cljs"
    "src/main/frontend/components/property.cljs"
+   "src/main/frontend/components/property"
+   "src/main/frontend/components/db_based"
    "src/electron/electron/db.cljs"])
 
 (def file-graph-paths
   "Paths _only_ for file graphs"
   ["src/main/frontend/handler/file_based" "src/main/frontend/handler/conversion.cljs" "src/main/frontend/handler/file_sync.cljs"
+   "src/main/frontend/db/file_based"
    "src/main/frontend/fs"
    "src/main/frontend/components/conversion.cljs" "src/main/frontend/components/file_sync.cljs"
    "src/main/frontend/util/fs.cljs"

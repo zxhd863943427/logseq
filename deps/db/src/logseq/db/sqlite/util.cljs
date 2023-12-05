@@ -4,9 +4,7 @@
             [cljs-time.core :as t]
             [clojure.string :as string]
             [cognitect.transit :as transit]
-            [datascript.core :as d]
-            [logseq.db.frontend.schema :as db-schema]
-            [logseq.db.frontend.property :as db-property]))
+            [logseq.db.frontend.schema :as db-schema]))
 
 (defn- type-of-block
   "
@@ -20,6 +18,7 @@
   |     4 | db schema                                      |
   |     5 | unknown type                                   |
   |     6 | property block                                 |
+  |     7 | macro                                          |
   "
   [block]
   (cond
@@ -29,6 +28,8 @@
     (:block/name block) 2
     (contains? (set (:block/type block)) "macro") 7
     :else 5))
+
+(defonce db-version-prefix "logseq_db_")
 
 (defn time-ms
   "Copy of util/time-ms. Too basic to couple this to main app"
@@ -70,7 +71,7 @@
          (transit/write t-writer))))
 
 (defn block-with-timestamps
-  "Copy of outliner-core/block-with-timestamps. Too basic to couple this to main app"
+  "Adds updated-at timestamp and created-at if it doesn't exist"
   [block]
   (let [updated-at (time-ms)
         block (cond->
@@ -94,28 +95,3 @@
            :block/journal? false
            :block/format :markdown}
           block)))
-
-(defn build-db-initial-data
-  [config-content]
-  (let [initial-files [{:block/uuid (d/squuid)
-                        :file/path (str "logseq/" "config.edn")
-                        :file/content config-content
-                        :file/last-modified-at (js/Date.)}
-                       {:block/uuid (d/squuid)
-                        :file/path (str "logseq/" "custom.css")
-                        :file/content ""
-                        :file/last-modified-at (js/Date.)}
-                       {:block/uuid (d/squuid)
-                        :file/path (str "logseq/" "custom.js")
-                        :file/content ""
-                        :file/last-modified-at (js/Date.)}]
-        default-properties (map
-                            (fn [[k-keyword {:keys [schema original-name]}]]
-                              (let [k-name (name k-keyword)]
-                                (build-new-property
-                                 {:block/schema schema
-                                  :block/original-name (or original-name k-name)
-                                  :block/name (sanitize-page-name k-name)
-                                  :block/uuid (d/squuid)})))
-                            db-property/built-in-properties)]
-    (concat initial-files default-properties)))

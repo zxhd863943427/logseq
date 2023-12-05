@@ -1,11 +1,9 @@
 (ns frontend.db.restore
   "Fns for DB restore(from text or sqlite)"
-  (:require [clojure.string :as string]
-            [datascript.core :as d]
+  (:require [datascript.core :as d]
             [frontend.config :as config]
-            [frontend.db :as db]
             [frontend.db.conn :as db-conn]
-            [frontend.db.migrate :as db-migrate]
+            [frontend.db.file-based.migrate :as db-migrate]
             [frontend.db.persist :as db-persist]
             [frontend.db.react :as react]
             [frontend.db.utils :as db-utils]
@@ -18,7 +16,8 @@
             [promesa.core :as p]
             [frontend.util :as util]
             [cljs-time.core :as t]
-            [logseq.db.frontend.property :as db-property]))
+            [logseq.db.frontend.property :as db-property]
+            [logseq.db.frontend.property.util :as db-property-util]))
 
 (defn- old-schema?
   "Requires migration if the schema version is older than db-schema/version"
@@ -67,26 +66,34 @@
 
 (defn- update-built-in-properties!
   [conn]
-  (let [txs (keep
-             (fn [[k-keyword {:keys [schema original-name]}]]
+  (let [txs (mapcat
+             (fn [[k-keyword {:keys [schema original-name] :as property-config}]]
                (let [k-name (name k-keyword)
                      property (d/entity @conn [:block/name k-name])]
-                 (when-not (= {:schema schema
+                 (when (and
+                        (not= {:schema schema
                                :original-name (or original-name k-name)}
                               {:schema (:block/schema property)
                                :original-name (:block/original-name property)})
+                         ;; Updating closed values disabled until it's worth the effort
+                         ;; to diff closed values
+                        (not (:closed-values property-config)))
                    (if property
-                     {:block/schema schema
-                      :block/original-name (or original-name k-name)
-                      :block/name (util/page-name-sanity-lc k-name)
-                      :block/uuid (:block/uuid property)
-                      :block/type "property"}
-                     (sqlite-util/block-with-timestamps
-                      {:block/schema schema
+                     [{:block/schema schema
                        :block/original-name (or original-name k-name)
                        :block/name (util/page-name-sanity-lc k-name)
-                       :block/uuid (db/new-block-id)
-                       :block/type "property"})))))
+                       :block/uuid (:block/uuid property)
+                       :block/type "property"}]
+                     (if (:closed-values property-config)
+                       (db-property-util/build-closed-values
+                        (or original-name k-name)
+                        (assoc property-config :block/uuid (d/squuid))
+                        {})
+                       [(sqlite-util/build-new-property
+                         {:block/schema schema
+                          :block/original-name (or original-name k-name)
+                          :block/name (util/page-name-sanity-lc k-name)
+                          :block/uuid (d/squuid)})])))))
              db-property/built-in-properties)]
     (when (seq txs)
       (d/transact! conn txs))))
@@ -112,6 +119,7 @@
       (state/set-state! [repo :restore/unloaded-blocks] nil)
       (state/set-state! [repo :restore/unloaded-pages] nil)
       (state/set-state! :graph/loading? false)
+      (react/clear-query-state!)
       (state/pub-event! [:ui/re-render-root]))))
 
 (defn- restore-graph-from-sqlite!
@@ -119,7 +127,6 @@
   [repo]
   (state/set-state! :graph/loading? true)
   (p/let [start-time (t/now)
-          ; data (ipc/ipc :get-initial-data repo)
           data (persist-db/<fetch-init-data repo)
           {:keys [conn uuid->db-id-map journal-blocks datoms-count]}
           (sqlite-restore/restore-initial-data data {:conn-from-datoms-fn
@@ -134,14 +141,9 @@
     ;; TODO: Store schema in sqlite
     ;; (db-migrate/migrate attached-db)
 
-    (d/transact! conn [(react/kv :db/type "db")
-                       {:schema/version db-schema/version}]
-                 {:skip-persist? true})
-
     (js/setTimeout
      (fn []
-       (p/let [;other-data (ipc/ipc :get-other-data repo (map :uuid journal-blocks))
-               other-data (persist-db/<fetch-blocks-excluding repo (map :uuid journal-blocks))
+       (p/let [other-data (persist-db/<fetch-blocks-excluding repo (map :uuid journal-blocks))
                _ (set-unloaded-block-ids! repo other-data)
                _ (p/delay 10)]
          (restore-other-data-from-sqlite! repo other-data uuid->db-id-map)))
@@ -150,7 +152,7 @@
 (defn restore-graph!
   "Restore db from serialized db cache"
   [repo]
-  (if (string/starts-with? repo config/db-version-prefix)
+  (if (config/db-based-graph? repo)
     (restore-graph-from-sqlite! repo)
     (p/let [db-name (db-conn/datascript-db repo)
             stored (db-persist/get-serialized-graph db-name)]

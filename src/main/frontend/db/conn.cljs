@@ -9,7 +9,8 @@
             [logseq.graph-parser.text :as text]
             [logseq.db :as ldb]
             [logseq.db.frontend.schema :as db-schema]
-            [logseq.graph-parser.util :as gp-util]))
+            [logseq.graph-parser.util :as gp-util]
+            [datascript.core :as d]))
 
 (defonce conns (atom {}))
 
@@ -36,15 +37,18 @@
 (defn get-short-repo-name
   "repo-name: from get-repo-name. Dir/Name => Name"
   [repo-name]
-  (cond
-    (util/electron?)
-    (text/get-file-basename repo-name)
+  (let [repo-name' (cond
+                     (util/electron?)
+                     (text/get-file-basename repo-name)
 
-    (mobile-util/native-platform?)
-    (gp-util/safe-decode-uri-component (text/get-file-basename repo-name))
+                     (mobile-util/native-platform?)
+                     (gp-util/safe-decode-uri-component (text/get-file-basename repo-name))
 
-    :else
-    repo-name))
+                     :else
+                     repo-name)]
+    (if (config/db-based-graph? repo-name')
+      (string/replace-first repo-name' config/db-version-prefix "")
+      repo-name')))
 
 (defn datascript-db
   [repo]
@@ -81,6 +85,12 @@
   [repo]
   (swap! conns dissoc (datascript-db repo)))
 
+(defn kv
+  [key value]
+  {:db/id -1
+   :db/ident key
+   key value})
+
 (defn start!
   ([repo]
    (start! repo {}))
@@ -88,6 +98,9 @@
    (let [db-name (datascript-db repo)
          db-conn (ldb/start-conn :schema (get-schema repo) :create-default-pages? false)]
      (swap! conns assoc db-name db-conn)
+     (when db-graph?
+       (d/transact! db-conn [(kv :db/type "db")])
+       (d/transact! db-conn [(kv :schema/version db-schema/version)]))
      (when listen-handler
        (listen-handler repo))
      (ldb/create-default-pages! db-conn {:db-graph? db-graph?}))))

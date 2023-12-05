@@ -83,7 +83,8 @@
             [reitit.frontend.easy :as rfe]
             [rum.core :as rum]
             [shadow.loader :as loader]
-            [logseq.common.path :as path]))
+            [logseq.common.path :as path]
+            [electron.ipc :as ipc]))
 
 ;; local state
 (defonce *dragging?
@@ -316,7 +317,7 @@
                  :on-click      (fn [e]
                                   (util/stop e)
                                   (if local?
-                                    (js/window.apis.showItemInFolder image-src)
+                                    (ipc/ipc "openFileInFolder" image-src)
                                     (js/window.apis.openExternal image-src)))}
                 image-src])
              [:.flex
@@ -2084,7 +2085,7 @@
                                                        :page-id (:db/id (:block/page block))})]
     (cond
       (seq ordered-properties)
-      [:div.block-properties
+      [:div.block-properties.rounded
        {:class (when pre-block? "page-properties")
         :title (if pre-block?
                  "Click to edit this page's properties"
@@ -2319,7 +2320,7 @@
       [:div.closed-values-properties.flex.flex-row.items-center.gap-1.select-none.h-full
        (for [pid closed-values-properties]
          (when-let [property (db/entity [:block/uuid pid])]
-           (pv/property-value block property (get (:block/properties block) pid) {:icon? true})))])))
+           (pv/property-value block property (get (:block/properties block) pid) {:icon? true :page-cp page-cp})))])))
 
 (rum/defc ^:large-vars/cleanup-todo block-content < rum/reactive
   [config {:block/keys [uuid content properties scheduled deadline format pre-block?] :as block} edit-input-id block-id slide? selected? *ref]
@@ -2541,8 +2542,7 @@
 
               (block-refs-count block refs-count *hide-block-refs?)])]
 
-          (when (and (not hide-block-refs?) (> refs-count 0)
-                     (not (:in-property? config)))
+          (when (and (not hide-block-refs?) (> refs-count 0))
             (let [refs-cp (state/get-component :block/linked-references)]
               (refs-cp uuid)))]))]))
 
@@ -2610,12 +2610,16 @@
                               level-limit 3}
                          :as opts}]
   (when block-id
-    (let [block-id (or (when (and block-id (config/db-based-graph? repo))
-                         (some-> (db-property-handler/get-property-block-created-block [:block/uuid block-id])
-                                 db/entity
-                                 :block/uuid))
-                       block-id)
-          parents (db/get-block-parents repo block-id {:depth (inc level-limit)})
+    (let [{:keys [from-block-id from-property-id]}
+          (when (and block-id (config/db-based-graph? repo))
+            (db-property-handler/get-property-block-created-block [:block/uuid block-id]))
+          from-block (when from-block-id (db/entity from-block-id))
+          from-property (when from-property-id (db/entity from-property-id))
+          block-id (or (:block/uuid from-block) block-id)
+          parents (concat
+                   (db/get-block-parents repo block-id {:depth (inc level-limit)})
+                   (when (and from-block from-property)
+                     [from-block from-property]))
           page (or (db/get-block-page repo block-id) ;; only return for block uuid
                    (model/query-block-by-uuid block-id)) ;; return page entity when received page uuid
           page-name (:block/name page)
@@ -2634,7 +2638,8 @@
                                  {:block/name (or page-original-name page-name)}])
               parents-props (doall
                              (for [{:block/keys [uuid name content] :as block} parents]
-                               (when-not name ; not page
+                               (if name
+                                 [block (page-cp {} block)]
                                  (let [{:block/keys [title body]} (block/parse-title-and-body
                                                                    uuid
                                                                    (:block/format block)
@@ -2649,10 +2654,11 @@
               breadcrumb (->> (into [] parents-props)
                               (concat [page-name-props] (when more? [:more]))
                               (filterv identity)
-                              (map (fn [x] (if (and (vector? x) (second x))
-                                             (let [[block label] x]
-                                               (rum/with-key (breadcrumb-fragment config block label opts) (:block/uuid block)))
-                                             [:span.opacity-70 "⋯"])))
+                              (map (fn [x]
+                                     (if (and (vector? x) (second x))
+                                       (let [[block label] x]
+                                         (rum/with-key (breadcrumb-fragment config block label opts) (:block/uuid block)))
+                                       [:span.opacity-70 "⋯"])))
                               (interpose (breadcrumb-separator)))]
           (when (seq breadcrumb)
             [:div.breadcrumb.block-parents
@@ -3598,10 +3604,8 @@
                          (:db/id parent)))))
                  {:debug-id page})])))))]
 
-     (and (:ref? config)
-          (:group-by-page? config)
-          (vector? (first blocks)))
-     [:div.flex.flex-col
+     (and (:ref? config) (:group-by-page? config) (vector? (first blocks)))
+     [:div.flex.flex-col.references-blocks-wrap
       (let [blocks (sort-by (comp :block/journal-day first) > blocks)]
         (for [[page page-blocks] blocks]
           (ui/lazy-visible
@@ -3611,7 +3615,7 @@
                    page (db/entity (:db/id page))
                    ;; FIXME: parents need to be sorted
                    parent-blocks (group-by :block/parent page-blocks)]
-               [:div.my-2 {:key (str "page-" (:db/id page))}
+               [:div.my-2.references-blocks-item {:key (str "page-" (:db/id page))}
                 (ui/foldable
                  [:div
                   (page-cp config page)
