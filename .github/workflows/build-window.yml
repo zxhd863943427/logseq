@@ -1,140 +1,441 @@
-name: Build Desktop Release (Windows and Linux)
+# This is the main desktop application release workflow for both nightly and beta/stable releases.
+
+name: Build-Desktop-Release
 
 on:
   workflow_dispatch:
-  schedule:
+    inputs:
+      build-target:
+        description: 'Build Target (Release Type)'
+        type: choice
+        required: true
+        options:
+          - beta
+          - nightly
+          - non-release
+        default: "non-release"
+      git-ref:
+        description: "Release Git Ref (Which branch or tag to build?)"
+        required: true
+        default: "feat/db"
+      is-draft:
+        description: 'Draft Release? (Beta only, Nightly will always be a non-draft)'
+        type: boolean
+        required: true
+        default: true
+      is-pre-release:
+        description: 'Pre Release? (labeled as "PreRelease")'
+        type: boolean
+        required: true
+        default: true
+      enable-file-sync-production:
+        description: 'File sync production mode'
+        type: boolean
+        required: true
+        default: true
+      enable-plugins:
+        description: 'Build with plugin system support'
+        type: boolean
+        required: true
+        default: true
+      build-android:
+        description: 'Build Android App'
+        type: boolean
+        required: true
+        default: true
+  schedule: # Every workday at the 2 P.M. (UTC) we run a scheduled nightly build
     - cron: '0 14 * * MON-FRI'
 
 env:
-  NODE_VERSION: '16'
+  CLOJURE_VERSION: '1.11.1.1413'
+  NODE_VERSION: '18'
+  JAVA_VERSION: '11'
 
 jobs:
-
   compile-cljs:
-
-    runs-on: ubuntu-latest
-
+    runs-on: ubuntu-20.04
     steps:
-    - uses: actions/checkout@v3
+      - name: Check build options
+        if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'nightly' || github.event.inputs.build-target == 'beta') && github.event.inputs.git-ref != 'master' }}
+        run: |
+          echo "::error title=CheckFail::Nightly and Beta Release MUST be built from master"
+          exit 1
 
-    - name: Install Node.js
-      uses: actions/setup-node@v3
-      with:
-        node-version: ${{ env.NODE_VERSION }}
+      - name: Check out Git repository
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.inputs.git-ref }}
 
-    - name: Install deps
-      run: yarn
+      - name: Install Node.js, NPM and Yarn
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
 
-    - name: Compile CLJS
-      run: yarn build
+      - name: Get yarn cache directory path
+        id: yarn-cache-dir-path
+        run: echo "dir=$(yarn cache dir)" >> $GITHUB_OUTPUT
 
-    - name: Prepare static files
-      run: |
-        cp -r dist static
-        echo "0.1.0" > static/VERSION 
+      - name: Cache yarn cache directory
+        uses: actions/cache@v3
+        id: yarn-cache
+        with:
+          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
 
-    - name: Upload static files
-      uses: actions/upload-artifact@v3
-      with:
-        name: static
-        path: static
+      - name: Setup Java JDK
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'zulu'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Cache clojure deps
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+          key: ${{ runner.os }}-clojure-lib-${{ hashFiles('**/deps.edn') }}
+
+      - name: Setup clojure
+        uses: DeLaGuardo/setup-clojure@10.1
+        with:
+          cli: ${{ env.CLOJURE_VERSION }}
+
+      - name: Retrieve tag version
+        id: ref
+        run: |
+          pkgver=$(node ./scripts/get-pkg-version.js "${{ github.event.inputs.build-target }}")
+          echo "version=$pkgver" >> $GITHUB_OUTPUT
+
+      - name: Do Not Overwrite Existing Release
+        if: ${{ github.event.inputs.build-target == 'beta' }}
+        run: |
+          if curl -f "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.ref.outputs.version }}" &>/dev/null; then
+            echo "::error title=CheckFail::Release already exists"
+            exit 1
+          fi
+
+      - name: Update Nightly APP Version
+        if: ${{ github.event.inputs.build-target == 'nightly' || github.event_name == 'schedule' }}
+        run: |
+          sed -i 's/defonce version ".*"/defonce version "${{ steps.ref.outputs.version }}"/g' src/main/frontend/version.cljs
+
+      - name: Set Build Environment Variables (only when workflow_dispatch)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        # if scheduled, use default settings
+        run: |
+          echo "ENABLE_PLUGINS=${{ github.event_name == 'schedule' || github.event.inputs.enable-plugins == 'true' }}" >> $GITHUB_ENV
+          echo "ENABLE_FILE_SYNC_PRODUCTION=${{ github.event_name == 'schedule' || github.event.inputs.enable-file-sync-production == 'true' }}" >> $GITHUB_ENV
+
+      - name: Compile CLJS
+        run: yarn install && gulp build && yarn cljs:release-electron
+        env:
+          LOGSEQ_SENTRY_DSN: ${{ secrets.LOGSEQ_SENTRY_DSN }}
+          LOGSEQ_POSTHOG_TOKEN: ${{ secrets.LOGSEQ_POSTHOG_TOKEN }}
+
+      - name: Update APP Version
+        run: |
+          sed -i 's/"version": "0.0.1"/"version": "${{ steps.ref.outputs.version }}"/g' ./package.json
+        working-directory: ./static
+
+      - name: Display Package.json
+        run: cat ./package.json
+        working-directory: ./static
+
+      - name: Save VERSION file
+        run: echo "${{ steps.ref.outputs.version }}" > ./VERSION
+        working-directory: ./static
+
+      - name: List Files
+        run: ls -al
+        working-directory: ./static
+
+      - name: Upload Sentry Sourcemaps (beta only)
+        if: ${{ github.repository == 'logseq/logseq' && github.event_name == 'workflow_dispatch' && github.event.inputs.build-target == 'beta' }}
+        run: |
+          curl -sL https://sentry.io/get-cli/ | bash
+          release_name="logseq@${{ steps.ref.outputs.version }}"
+          sentry-cli releases new "${release_name}"
+          sentry-cli releases files "${release_name}" upload-sourcemaps --ext map --ext js ./static/js --url-prefix '~/static/js'
+          sentry-cli releases finalize "${release_name}"
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: logseq
+          SENTRY_PROJECT: logseq
+
+      - name: Cache Static File
+        uses: actions/upload-artifact@v3
+        with:
+          name: static
+          path: static
+
+  
 
   build-linux:
-
-    runs-on: ubuntu-latest
-    
+    runs-on: ubuntu-20.04
+    needs: [ compile-cljs ]
     steps:
-    - uses: actions/checkout@v3
+      - name: Download The Static Asset
+        uses: actions/download-artifact@v3
+        with:
+          name: static
+          path: static
 
-    - name: Download static files
-      uses: actions/download-artifact@v3
-      with:
-        name: static
-        path: static
+      - name: Retrieve tag version
+        id: ref
+        run: |
+          pkgver=$(cat ./static/VERSION)
+          echo "version=$pkgver" >> $GITHUB_OUTPUT
 
-    - name: Install Node.js
-      uses: actions/setup-node@v3
-      with:
-        node-version: ${{ env.NODE_VERSION }}
+      - name: Install Node.js, NPM and Yarn
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
 
-    - name: Install deps
-      run: yarn
+      # - name: Cache Node Modules
+      #   uses: actions/cache@v3
+      #   with:
+      #     path: |
+      #       **/node_modules
+      #     key: ${{ runner.os }}-node-modules
 
-    - name: Build AppImage
-      run: yarn build:linux
+      - name: Build/Release Electron App
+        run: yarn install && yarn electron:make
+        working-directory: ./static
 
-    - name: Prepare artifact
-      run: |
-        mkdir builds
-        cp dist/linux/*.AppImage builds/
+      - name: Save artifacts
+        run: |
+          mkdir -p builds
+          # NOTE: save VERSION file to builds directory
+          cp static/VERSION ./builds/VERSION
+          mv static/out/make/*-*.AppImage ./builds/Logseq-linux-x64-${{ steps.ref.outputs.version }}.AppImage
+          mv static/out/make/zip/linux/x64/*-linux-x64-*.zip ./builds/Logseq-linux-x64-${{ steps.ref.outputs.version }}.zip
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v3
-      with:
-        name: logseq-linux-build
-        path: builds
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: logseq-linux-builds
+          path: builds
 
   build-windows:
-
     runs-on: windows-latest
-
+    needs: [ compile-cljs ]
     steps:
-    - uses: actions/checkout@v3
+      - name: Download The Static Asset
+        uses: actions/download-artifact@v3
+        with:
+          name: static
+          path: static
 
-    - name: Download static files  
-      uses: actions/download-artifact@v3
-      with:
-        name: static
-        path: static
+      - name: Retrieve tag version
+        id: ref
+        run: echo "version=$(cat ./static/VERSION)" >> $env:GITHUB_OUTPUT
 
-    - name: Install Node.js
-      uses: actions/setup-node@v3
-      with:
-        node-version: ${{ env.NODE_VERSION }}
+      - name: Install Node.js, NPM and Yarn
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
 
-    - name: Install deps  
-      run: yarn
+      # - name: Cache Node Modules
+      #   uses: actions/cache@v3
+      #   with:
+      #    path: |
+      #      **/node_modules
+      #    key: ${{ runner.os }}-node-modules
 
-    - name: Build Windows installer
-      run: yarn build:win
+      - name: Deps Electron app
+        run: yarn install
+        working-directory: ./static
 
-    - name: Prepare artifact
-      run: |
-        mkdir builds
-        cp dist/win/*.exe builds/
+      - name: Fix Deps Electron app
+        run: yarn run postinstall
+        working-directory: ./static/node_modules/dugite/
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v3
-      with:
-        name: logseq-win-build
-        path: builds
+      - name: Prepare Code Sign
+        if: ${{ github.repository == 'logseq/logseq' }}
+        run: |
+          [IO.File]::WriteAllBytes($(Get-Location).Path + "\codesign.pfx", [Convert]::FromBase64String($env:CERTIFICATE))
+        env:
+          CERTIFICATE: ${{ secrets.CODE_SIGN_CERTIFICATE }}
+
+      - name: Build/Release Electron app
+        run: yarn electron:make
+        working-directory: ./static
+        #env:
+        #  CODE_SIGN_CERTIFICATE_FILE: ../codesign.pfx
+        #  CODE_SIGN_CERTIFICATE_PASSWORD: ${{ secrets.CODE_SIGN_CERTIFICATE_PASSWORD }}
+
+      - name: Save Artifact
+        run: |
+          mkdir builds
+          mv static\out\make\squirrel.windows\x64\*.exe    builds\Logseq-win-x64-${{ steps.ref.outputs.version }}.exe
+          mv static\out\make\squirrel.windows\x64\*.nupkg  builds\Logseq-win-x64-${{ steps.ref.outputs.version }}-full.nupkg
+          mv static\out\make\squirrel.windows\x64\RELEASES builds\RELEASES
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: logseq-win64-builds
+          path: builds
+
+
+  # reuse workflow via workflow_call
+  build-android:
+    uses: ./.github/workflows/build-android.yml
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.build-android == 'true' }}
+    with:
+      build-target: "${{ github.event.inputs.build-target }}"
+      # if scheduled, use production mode
+      enable-file-sync-production: "${{ github.event_name == 'schedule' || github.event.inputs.enable-file-sync-production == 'true' }}"
+    secrets:
+      ANDROID_KEYSTORE: "${{ secrets.ANDROID_KEYSTORE }}"
+      ANDROID_KEYSTORE_PASSWORD: "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}"
+      SENTRY_AUTH_TOKEN: "${{ secrets.SENTRY_AUTH_TOKEN }}"
+
+  nightly-release:
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.build-target == 'nightly' }}
+    needs: [ build-linux, build-windows ]
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Download MacOS x64 Artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: logseq-darwin-x64-builds
+          path: ./
+
+      - name: Download MacOS arm64 Artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: logseq-darwin-arm64-builds
+          path: ./
+
+      - name: Download The Linux Artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: logseq-linux-builds
+          path: ./
+
+      - name: Download The Windows Artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: logseq-win64-builds
+          path: ./
+
+      - name: Download Android Artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: logseq-android-builds
+          path: ./
+
+      - name: Generate SHA256 checksums
+        run: |
+          sha256sum *-darwin-* > SHA256SUMS.txt
+          sha256sum *-win-* >> SHA256SUMS.txt
+          sha256sum *-linux-* >> SHA256SUMS.txt
+          sha256sum *.apk >> SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: List files
+        run: ls -rl
+
+      - name: Update Nightly Release
+        uses: andelf/nightly-release@main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: nightly
+          name: 'Desktop/Android APP Nightly Release $$'
+          draft: false
+          prerelease: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.is-pre-release) || (github.event_name == 'schedule')}}
+          body: |
+            This is a nightly release of the Logseq desktop app.
+            It's unstable compared to the official releases, **use it with caution**!
+          files: |
+            ./SHA256SUMS.txt
+            ./*.zip
+            ./*.dmg
+            ./*.exe
+            ./*.AppImage
+            ./*.apk
 
   release:
-
-    runs-on: ubuntu-latest
-
+    # NOTE: For now, we only have beta channel to be released on Github
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.build-target == 'beta' }}
+    needs: [ build-linux, build-windows ]
+    runs-on: ubuntu-20.04
     steps:
-    - name: Download Linux artifact
-      uses: actions/download-artifact@v3
-      with:
-        name: logseq-linux-build
-        path: ./
+      - name: Download MacOS x64 Artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: logseq-darwin-x64-builds
+          path: ./
 
-    - name: Download Windows artifact
-      uses: actions/download-artifact@v3
-      with:
-        name: logseq-win-build
-        path: ./
+      - name: Download MacOS arm64 Artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: logseq-darwin-arm64-builds
+          path: ./
 
-    - name: Create Release
-      uses: softprops/action-gh-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: v0.1.0
-        name: Release v0.1.0
-        draft: false
-        prerelease: false
-        files: |
-          *.AppImage
-          *.exe
+      - name: Download The Linux Artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: logseq-linux-builds
+          path: ./
+
+      - name: Download The Windows Artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: logseq-win64-builds
+          path: ./
+
+      - name: Download Android Artifacts
+        uses: actions/download-artifact@v3
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.build-android == 'true' }}
+        with:
+          name: logseq-android-builds
+          path: ./
+
+      - name: List files
+        run: ls -rl
+
+      - name: Retrieve tag version
+        id: ref
+        run: |
+          pkgver=$(cat VERSION)
+          echo "version=$pkgver" >> $GITHUB_OUTPUT
+
+      - name: Fix .nupkg name in RELEASES file
+        run: |
+          sed -i "s/Logseq-.*.nupkg/Logseq-win-x64-${{ steps.ref.outputs.version }}-full.nupkg/g" RELEASES
+
+      - name: Generate SHA256 checksums
+        run: |
+          sha256sum *-darwin-* > SHA256SUMS.txt
+          sha256sum *-win-* >> SHA256SUMS.txt
+          sha256sum *-linux-* >> SHA256SUMS.txt
+          sha256sum *.apk >> SHA256SUMS.txt
+          sha256sum RELEASES >> SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create Release Draft
+        uses: softprops/action-gh-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.ref.outputs.version }}
+          name: Desktop/Android APP ${{ steps.ref.outputs.version }} (Beta Testing)
+          body: "TODO: Fill this changelog. Sorry for the inconvenience!"
+          draft: ${{ github.event.inputs.is-draft }}
+          prerelease: ${{ github.event.inputs.is-pre-release }}
+          files: |
+            ./VERSION
+            ./SHA256SUMS.txt
+            ./*.zip
+            ./*.dmg
+            ./*.exe
+            ./*.nupkg
+            ./RELEASES
+            ./*.AppImage
+            ./*.apk
