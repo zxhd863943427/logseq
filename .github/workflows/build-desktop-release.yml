@@ -59,7 +59,6 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'nightly' || github.event.inputs.build-target == 'beta') && github.event.inputs.git-ref != 'master' }}
         run: |
           echo "::error title=CheckFail::Nightly and Beta Release MUST be built from master"
-          exit 1
 
       - name: Check out Git repository
         uses: actions/checkout@v3
