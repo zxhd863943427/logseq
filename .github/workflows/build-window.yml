@@ -1,6 +1,6 @@
 # This is the main desktop application release workflow for both nightly and beta/stable releases.
 
-name: Build-Desktop-Release
+name: Build-Desktop-Release(window and linux)
 
 on:
   workflow_dispatch:
