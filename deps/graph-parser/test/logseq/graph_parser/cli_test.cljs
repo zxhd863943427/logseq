@@ -5,9 +5,6 @@
             [clojure.string :as string]
             [datascript.core :as d]
             [logseq.db.sqlite.db :as sqlite-db]
-            [logseq.db.sqlite.cli :as sqlite-cli]
-            [logseq.db.sqlite.util :as sqlite-util]
-            [cljs-bean.core :as bean]
             [logseq.db :as ldb]
             [clojure.set :as set]
             ["fs" :as fs]
@@ -115,7 +112,6 @@
                 (mapv #(merge %
                               {:db/id (new-db-id)
                                :block/uuid (random-uuid)
-                               :page_uuid page-uuid
                                :block/format :markdown
                                :block/path-refs [{:db/id page-id}]
                                :block/page {:db/id page-id}
@@ -130,13 +126,9 @@
   "Creates a sqlite-based db graph given a map of pages to blocks and returns a datascript db.
    Blocks in a map can only be top-level blocks with no referenced content"
   [dir db-name pages-to-blocks]
-  (sqlite-db/open-db! dir db-name)
-  (let [frontend-blocks (create-frontend-blocks pages-to-blocks)
-        blocks (mapv #(sqlite-util/ds->sqlite-block
-                       (assoc % :datoms (sqlite-util/block-map->datoms-str frontend-blocks %)))
-                     frontend-blocks)
-        _ (sqlite-db/upsert-blocks! db-name (bean/->js blocks))
-        conn (sqlite-cli/read-graph db-name)]
+  (let [conn (sqlite-db/open-db! dir db-name)
+        frontend-blocks (create-frontend-blocks pages-to-blocks)
+        _ (d/transact! conn frontend-blocks)]
     (ldb/create-default-pages! conn {:db-graph? true})
     @conn))
 

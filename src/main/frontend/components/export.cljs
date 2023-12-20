@@ -1,6 +1,7 @@
 (ns frontend.components.export
   (:require [cljs-time.core :as t]
             ["/frontend/utils" :as utils]
+            [frontend.config :as config]
             [frontend.context.i18n :refer [t]]
             [frontend.db :as db]
             [frontend.handler.export.text :as export-text]
@@ -26,6 +27,10 @@
       [:li.mb-4
        [:a.font-medium {:on-click #(export/export-repo-as-json-v2! current-repo)}
         (t :export-json)]]
+      (when (config/db-based-graph? current-repo)
+       [:li.mb-4
+        [:a.font-medium {:on-click #(export/export-repo-as-sqlite-db! current-repo)}
+         (t :export-sqlite-db)]])
       (when (util/electron?)
         [:li.mb-4
          [:a.font-medium {:on-click #(export/download-repo-as-html! current-repo)}
@@ -44,6 +49,7 @@
           (t :export-roam-json)]])]
      [:a#download-as-edn-v2.hidden]
      [:a#download-as-json-v2.hidden]
+     [:a#download-as-sqlite-db.hidden]
      [:a#download-as-roam-json.hidden]
      [:a#download-as-html.hidden]
      [:a#download-as-zip.hidden]

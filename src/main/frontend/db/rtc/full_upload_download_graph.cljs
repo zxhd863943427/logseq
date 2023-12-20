@@ -13,7 +13,7 @@
             [frontend.db.rtc.ws :refer [<send!]]
             [frontend.persist-db :as persist-db]
             [logseq.db.frontend.schema :as db-schema]
-            [logseq.outliner.pipeline :as outliner-pipeline]))
+            [frontend.state :as state]))
 
 (def transit-r (transit/reader :json))
 
@@ -69,24 +69,26 @@
   [blocks]
   (mapv
    (fn [block]
-     (let [db-id (:db/id block)
-           block-parent (:db/id (:block/parent block))
-           block-left (:db/id (:block/left block))
-           block-alias (map :db/id (:block/alias block))
-           block-tags (map :db/id (:block/tags block))
-           block-type (keep (comp block-type-ident->str :db/ident) (:block/type block))
-           block-schema (some->> (:block/schema block)
-                                 (transit/read transit-r))
+     (let [db-id            (:db/id block)
+           block-parent     (:db/id (:block/parent block))
+           block-left       (:db/id (:block/left block))
+           block-alias      (map :db/id (:block/alias block))
+           block-tags       (map :db/id (:block/tags block))
+           block-type       (keep (comp block-type-ident->str :db/ident) (:block/type block))
+           block-schema     (some->> (:block/schema block)
+                                     (transit/read transit-r))
            block-properties (some->> (:block/properties block)
-                                     (transit/read transit-r))]
+                                     (transit/read transit-r))
+           block-link       (:db/id (:block/link block))]
        (cond-> (assoc block :db/id (str db-id))
-         block-parent (assoc :block/parent (str block-parent))
-         block-left (assoc :block/left (str block-left))
+         block-parent      (assoc :block/parent (str block-parent))
+         block-left        (assoc :block/left (str block-left))
          (seq block-alias) (assoc :block/alias (map str block-alias))
          (seq block-tags)  (assoc :block/tags (map str block-tags))
          (seq block-type)  (assoc :block/type block-type)
          block-schema      (assoc :block/schema block-schema)
-         block-properties  (assoc :block/properties block-properties))))
+         block-properties  (assoc :block/properties block-properties)
+         block-link        (assoc :block/link (str block-link)))))
    blocks))
 
 (def page-of-block
@@ -117,18 +119,13 @@
   [all-blocks repo]
   (go-try
    (let [{:keys [t blocks]} all-blocks
-         conn (d/create-conn db-schema/schema-for-db-based-graph)
          blocks* (replace-db-id-with-temp-id blocks)
          blocks-with-page-id (fill-block-fields blocks*)]
-     (d/transact! conn blocks-with-page-id)
-     (let [db (d/db conn)
-           blocks*
-           (d/pull-many db '[*] (keep (fn [b] (when-let [uuid (:block/uuid b)] [:block/uuid uuid])) blocks))
-           blocks** (outliner-pipeline/build-upsert-blocks blocks* nil db)]
-       (<? (p->c (persist-db/<new repo)))
-       (<? (persist-db/<transact-data repo blocks** nil))
-       (op-mem-layer/update-local-tx! repo t)))))
-
+     (<? (p->c (persist-db/<new repo)))
+     (<? (p->c (persist-db/<transact-data repo blocks-with-page-id nil)))
+     (<? (p->c (persist-db/<release-access-handles repo)))
+     (state/add-repo! {:url repo})
+     (op-mem-layer/update-local-tx! repo t))))
 
 (defn <download-graph
   [state repo graph-uuid]

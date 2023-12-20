@@ -4,7 +4,8 @@
             ["fs-extra" :as fs]
             ["electron" :refer [app]]
             [electron.logger :as logger]
-            [logseq.db.sqlite.db :as sqlite-db]))
+            [logseq.db.sqlite.db :as sqlite-db]
+            [electron.backup-file :as backup-file]))
 
 (def close! sqlite-db/close!)
 
@@ -17,20 +18,33 @@
   []
   (fs/ensureDirSync (get-graphs-dir)))
 
+(defn ensure-graph-dir!
+  [db-name]
+  (ensure-graphs-dir!)
+  (let [graph-dir (node-path/join (get-graphs-dir) (sqlite-db/sanitize-db-name db-name))]
+    (fs/ensureDirSync graph-dir)
+    graph-dir))
+
 (defn open-db!
   [db-name]
   (let [graphs-dir (get-graphs-dir)]
     (try (sqlite-db/open-db! graphs-dir db-name)
          (catch :default e
-           (logger/error (str e ": " db-name))
-           ;; (fs/unlinkSync db-full-path)
-           ))))
+           (js/console.error e)
+           (logger/error (str e ": " db-name))))))
 
-(defn new-db!
-  [db-name]
-  (let [graph-dir (node-path/join (get-graphs-dir) (sqlite-db/sanitize-db-name db-name))]
-    (fs/ensureDirSync graph-dir)
-    (open-db! db-name)))
+(defn save-db!
+  [db-name data]
+  (let [graph-dir (ensure-graph-dir! db-name)
+        [_db-name db-path] (sqlite-db/get-db-full-path (get-graphs-dir) db-name)]
+    (fs/writeFileSync db-path data)
+    (backup-file/backup-file graph-dir :backup-dir
+                             ""
+                             ".sqlite"
+                             data
+                             {:add-desktop? false
+                              :skip-backup-fn (fn [latest-backup-size]
+                                                (= latest-backup-size (.-length data)))})))
 
 (def unlinked-graphs-dir "Unlinked graphs")
 

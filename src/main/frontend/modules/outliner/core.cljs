@@ -133,7 +133,7 @@
 
 (defn- get-last-child-or-self
   [block]
-  (let [last-child (some-> (db-model/get-block-last-direct-child (conn/get-db) (:db/id block) true)
+  (let [last-child (some-> (db-model/get-block-last-direct-child-id (conn/get-db) (:db/id block) true)
                            db/entity)
         target (or last-child block)]
     [target (some? last-child)]))
@@ -303,13 +303,25 @@
                 fix-tag-ids)
           repo (state/get-current-repo)
           db-based? (config/db-based-graph? repo)
-          eid (or (:db/id (:data this))
-                  (when-let [block-uuid (:block/uuid (:data this))] [:block/uuid block-uuid]))
+          db-id (:db/id (:data this))
+          block-uuid (:block/uuid (:data this))
+          eid (or db-id (when block-uuid [:block/uuid block-uuid]))
           block-entity (db/entity eid)
           tags-has-class? (and db-based?
                                (some (fn [tag]
                                        (contains? (:block/type (db/entity [:block/uuid (:block/uuid tag)])) "class"))
                                      (:block/tags m)))]
+
+      ;; Ensure block UUID never changes
+      (when (and db-id block-uuid)
+        (let [uuid-not-changed? (= block-uuid (:block/uuid (db/entity db-id)))]
+          (when-not uuid-not-changed?
+            (when config/dev?
+              (state/pub-event! [:notification/show
+                                {:content "Block UUID shouldn't be changed"
+                                 :status :error}])))
+          (assert uuid-not-changed? "Block UUID changed")))
+
       (when eid
         ;; Retract attributes to prepare for tx which rewrites block attributes
         (when (:block/content m)
@@ -405,13 +417,21 @@
 
 (defn- assign-temp-id
   [blocks replace-empty-target? target-block]
-  (map-indexed (fn [idx block]
-                 ;; TODO: block uuid changed, this could be a problem for rtc
-                 (let [replacing-block? (and replace-empty-target? (zero? idx))
-                       db-id (if replacing-block?
-                               (:db/id target-block)
-                               (dec (- idx)))]
-                   (assoc block :db/id db-id))) blocks))
+  (->> (map-indexed (fn [idx block]
+                      (let [replacing-block? (and replace-empty-target? (zero? idx))]
+                        (if replacing-block?
+                          (let [db-id (or (:db/id block) (dec (- idx)))]
+                            (if (seq (:block/_parent target-block)) ; target-block has children
+                              ;; update block properties
+                              [(assoc block
+                                      :db/id (:db/id target-block)
+                                      :block/uuid (:block/uuid target-block))]
+                              [[:db/retractEntity (:db/id target-block)] ; retract target-block first
+                               (assoc block
+                                      :db/id db-id
+                                      :block/left (:db/id (:block/left target-block)))]))
+                          [(assoc block :db/id (dec (- idx)))]))) blocks)
+       (apply concat)))
 
 (defn- find-outdented-block-prev-hop
   [outdented-block blocks]
@@ -1073,7 +1093,7 @@
             opts {:outliner-op :indent-outdent-blocks}]
         (if indent?
           (when (and left (not (page-first-child? first-block)))
-            (let [last-direct-child-id (db-model/get-block-last-direct-child db (:db/id left))
+            (let [last-direct-child-id (db-model/get-block-last-direct-child-id db (:db/id left))
                   blocks' (drop-while (fn [b]
                                         (= (:db/id (:block/parent b))
                                            (:db/id left)))
@@ -1112,7 +1132,7 @@
                         right-siblings (->> (get-right-siblings (block last-top-block))
                                             (map :data))]
                     (if (seq right-siblings)
-                      (let [result2 (if-let [last-direct-child-id (db-model/get-block-last-direct-child db (:db/id last-top-block))]
+                      (let [result2 (if-let [last-direct-child-id (db-model/get-block-last-direct-child-id db (:db/id last-top-block))]
                                       (move-blocks right-siblings (db/entity last-direct-child-id) (merge opts {:sibling? true}))
                                       (move-blocks right-siblings last-top-block (merge opts {:sibling? false})))]
                         (concat-tx-fn result result2))

@@ -14,6 +14,7 @@
             [frontend.handler.common.file :as file-common-handler]
             [frontend.handler.route :as route-handler]
             [frontend.handler.ui :as ui-handler]
+            [frontend.handler.notification :as notification]
             [frontend.handler.global-config :as global-config-handler]
             [frontend.idb :as idb]
             [frontend.search :as search]
@@ -21,6 +22,7 @@
             [frontend.state :as state]
             [frontend.util :as util]
             [frontend.util.fs :as util-fs]
+            [frontend.util.text :as text-util]
             [frontend.persist-db :as persist-db]
             [promesa.core :as p]
             [shadow.resource :as rc]
@@ -342,16 +344,20 @@
   [{:keys [url] :as repo}]
   (let [db-based? (config/db-based-graph? url)
         delete-db-f (fn []
-                      (let [graph-exists? (db/get-db url)
-                            current-repo (state/get-current-repo)]
+                      (let [current-repo (state/get-current-repo)]
                         (db/remove-conn! url)
-                        (db-persist/delete-graph! url)
+                        (when db-based? (db-persist/delete-graph! url))
                         (search/remove-db! url)
                         (state/delete-repo! repo)
-                        (when graph-exists? (ipc/ipc "graphUnlinked" repo))
-                        (when (= current-repo url)
+                        (if (= current-repo url)
                           (when-let [graph (:url (first (state/get-repos)))]
-                            (state/pub-event! [:graph/switch graph {}])))))]
+                            (notification/show! (str "Removed graph "
+                                                     (pr-str (text-util/get-graph-name-from-path url))
+                                                     ". Redirecting to graph "
+                                                     (pr-str (text-util/get-graph-name-from-path url)))
+                                                :success)
+                            (state/pub-event! [:graph/switch graph {:persist? false}]))
+                          (notification/show! (str "Removed graph " (pr-str (text-util/get-graph-name-from-path url))) :success))))]
     (when (or (config/local-file-based-graph? url)
               db-based?
               (config/demo-graph? url))
@@ -359,10 +365,12 @@
           (p/finally delete-db-f)))))
 
 (defn start-repo-db-if-not-exists!
-  [repo]
+  [repo & {:as opts}]
   (state/set-current-repo! repo)
-  (db/start-db-conn! repo {:listen-handler db-listener/listen-and-persist!
-                           :db-graph? (config/db-based-graph? repo)}))
+  (db/start-db-conn! repo (merge
+                           opts
+                           {:listen-handler db-listener/listen-and-persist!
+                            :db-graph? (config/db-based-graph? repo)})))
 
 (defn- setup-local-repo-if-not-exists-impl!
   []
@@ -460,19 +468,7 @@
                                   {:error error
                                    :payload {:type :db/persist-failed}}])
                (when on-error
-                 (on-error)))))))
-
-(defn broadcast-persist-db!
-  "Only works for electron
-   Call backend to handle persisting a specific db on other window
-   Skip persisting if no other windows is open (controlled by electron)
-     step 1. [In HERE]  a window         ---broadcastPersistGraph---->   electron
-     step 2.            electron         ---------persistGraph------->   window holds the graph
-     step 3.            window w/ graph  --broadcastPersistGraphDone->   electron
-     step 4. [In HERE]  a window         <--broadcastPersistGraph-----   electron"
-  [graph]
-  (p/let [_ (ipc/ipc "broadcastPersistGraph" graph)] ;; invoke for chaining promise
-    nil))
+                 (on-error error)))))))
 
 (defn get-repos
   []
@@ -540,19 +536,23 @@
     (ipc/ipc "graphReady" graph)))
 
 (defn- create-db [full-graph-name]
-  (p/let [_ (persist-db/<new full-graph-name)
-          _ (op-mem-layer/<init-load-from-indexeddb! full-graph-name)
-          _ (start-repo-db-if-not-exists! full-graph-name)
-          _ (state/add-repo! {:url full-graph-name})
-          _ (route-handler/redirect-to-home!)
-          initial-data (sqlite-create-graph/build-db-initial-data config/config-default-content)
-          _ (db/transact! full-graph-name initial-data)
-          _ (repo-config-handler/set-repo-config-state! full-graph-name config/config-default-content)
+  (->
+   (p/let [_ (persist-db/<new full-graph-name)
+           _ (op-mem-layer/<init-load-from-indexeddb! full-graph-name)
+           _ (start-repo-db-if-not-exists! full-graph-name)
+           _ (state/add-repo! {:url full-graph-name})
+           _ (route-handler/redirect-to-home!)
+           initial-data (sqlite-create-graph/build-db-initial-data config/config-default-content)
+           _ (db/transact! full-graph-name initial-data)
+           _ (repo-config-handler/set-repo-config-state! full-graph-name config/config-default-content)
           ;; TODO: handle global graph
-          _ (state/pub-event! [:init/commands])
-          _ (state/pub-event! [:page/create (date/today) {:redirect? false}])]
-    (js/setTimeout ui-handler/re-render-root! 100)
-    (prn "New db created: " full-graph-name)))
+           _ (state/pub-event! [:init/commands])
+           _ (state/pub-event! [:page/create (date/today) {:redirect? false}])]
+     (js/setTimeout ui-handler/re-render-root! 100)
+     (prn "New db created: " full-graph-name))
+   (p/catch (fn [error]
+              (notification/show! "Create graph failed." :error)
+              (js/console.error error)))))
 
 (defn new-db!
   "Handler for creating a new database graph"

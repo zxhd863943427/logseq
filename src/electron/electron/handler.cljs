@@ -31,10 +31,11 @@
             [electron.utils :as utils]
             [electron.window :as win]
             [electron.handler-interface :refer [handle]]
-            [logseq.db.sqlite.db :as sqlite-db]
             [logseq.db.sqlite.util :as sqlite-util]
+            [logseq.db.sqlite.db :as sqlite-db]
             [logseq.common.graph :as common-graph]
-            [promesa.core :as p]))
+            [promesa.core :as p]
+            [clojure.edn :as edn]))
 
 (defmethod handle :mkdir [_window [_ dir]]
   (fs/mkdirSync dir))
@@ -226,14 +227,6 @@
     (fs-extra/ensureDirSync dir)
     dir))
 
-(defn- get-db-based-graphs-dir
-  []
-  (let [dir (if utils/ci?
-              (.resolve node-path js/__dirname "../tmp/graphs")
-              (.join node-path (.homedir os) "logseq" "graphs"))]
-    (fs-extra/ensureDirSync dir)
-    dir))
-
 ;; TODO: move file based graphs to "~/logseq/graphs" too
 (defn- get-file-based-graphs
   "Returns all graph names in the cache directory (starting with `logseq_local_`)"
@@ -244,20 +237,9 @@
          (map #(node-path/basename % ".transit"))
          (map graph-name->path))))
 
-(defn- get-db-based-graphs
-  "Returns all graph names in the cache directory"
-  []
-  (let [dir (get-db-based-graphs-dir)]
-    (->> (common-graph/read-directories dir)
-         (remove (fn [s] (= s db/unlinked-graphs-dir)))
-         (map graph-name->path)
-         (map (fn [s] (str sqlite-util/db-version-prefix s))))))
-
 (defn- get-graphs
   []
-  (concat
-   (get-file-based-graphs)
-   (get-db-based-graphs)))
+  (get-file-based-graphs))
 
 ;; TODO support alias mechanism
 (defn get-graph-name
@@ -338,15 +320,10 @@
 (defmethod handle :search-blocks [_window [_ repo q opts]]
   (search/search-blocks repo q opts))
 
-(defmethod handle :search-pages [_window [_ repo q opts]]
-  (search/search-pages repo q opts))
-
-(defmethod handle :rebuild-indice [_window [_ repo block-data page-data]]
+(defmethod handle :rebuild-indice [_window [_ repo block-data]]
   (search/truncate-blocks-table! repo)
   ;; unneeded serialization
   (search/upsert-blocks! repo (bean/->js block-data))
-  (search/truncate-pages-table! repo)
-  (search/upsert-pages! repo (bean/->js page-data))
   [])
 
 (defmethod handle :transact-blocks [_window [_ repo data]]
@@ -358,18 +335,8 @@
       ;; unneeded serialization
       (search/upsert-blocks! repo (bean/->js blocks-to-add)))))
 
-(defmethod handle :transact-pages [_window [_ repo data]]
-  (let [{:keys [pages-to-remove-set pages-to-add]} data]
-    ;; Order matters! Same id will delete then upsert sometimes.
-    (when (seq pages-to-remove-set)
-      (search/delete-pages! repo pages-to-remove-set))
-    (when (seq pages-to-add)
-      ;; unneeded serialization
-      (search/upsert-pages! repo (bean/->js pages-to-add)))))
-
 (defmethod handle :truncate-indice [_window [_ repo]]
-  (search/truncate-blocks-table! repo)
-  (search/truncate-pages-table! repo))
+  (search/truncate-blocks-table! repo))
 
 (defmethod handle :remove-db [_window [_ repo]]
   (search/delete-db! repo))
@@ -378,28 +345,21 @@
 
 ;; DB related IPCs start
 
-;; Needs to be called first for a new graph
-(defmethod handle :db-new [_window [_ repo]]
-  (db/new-db! repo))
+(defmethod handle :db-export [_window [_ repo data]]
+  (db/ensure-graph-dir! repo)
+  (db/save-db! repo data))
 
-(defmethod handle :db-transact-data [_window [_ repo data-str]]
-  (let [data (reader/read-string data-str)
-        {:keys [blocks deleted-block-uuids]} data]
-    (when (seq deleted-block-uuids)
-      (sqlite-db/delete-blocks! repo deleted-block-uuids))
-    (when (seq blocks)
-      (let [blocks' (mapv sqlite-util/ds->sqlite-block blocks)]
-        (when-let [unknown-blocks (seq (filter #(= 5 (:type %)) blocks'))]
-          (logger/error "The following blocks saved as unknown:" unknown-blocks))
-        (sqlite-db/upsert-blocks! repo (bean/->js blocks'))))))
-
-;; Needs to be called first for an existing graph
-(defmethod handle :get-initial-data [_window [_ repo _opts]]
+(defmethod handle :db-open [_window [_ repo]]
+  (db/ensure-graph-dir! repo)
   (db/open-db! repo)
-  (sqlite-db/get-initial-data repo))
+  nil)
 
-(defmethod handle :get-other-data [_window [_ repo journal-block-uuids _opts]]
-  (sqlite-db/get-other-data repo journal-block-uuids))
+(defmethod handle :db-transact [_window [_ repo tx-data-str tx-meta-str]]
+  (when-let [conn (sqlite-db/get-conn repo)]
+    (let [tx-data (edn/read-string tx-data-str)
+          tx-meta (edn/read-string tx-meta-str)]
+      (sqlite-db/transact! repo tx-data tx-meta)
+      (:max-tx @conn))))
 
 ;; DB related IPCs End
 
@@ -614,17 +574,6 @@
   (logger/info ::quick-and-install)
   (.quitAndInstall autoUpdater))
 
-(defmethod handle :graphUnlinked [^js _win [_ repo]]
-  (doseq [window (win/get-all-windows)]
-    (utils/send-to-renderer window "graphUnlinked" (bean/->clj repo))))
-
-(defmethod handle :dbsync [^js _win [_ graph tx-data]]
-  (let [dir (utils/get-graph-dir graph)]
-    (doseq [window (win/get-graph-all-windows dir)]
-      (utils/send-to-renderer window "dbsync"
-                              (bean/->clj {:graph graph
-                                           :tx-data tx-data})))))
-
 (defmethod handle :graphHasOtherWindow [^js win [_ graph]]
   (let [dir (utils/get-graph-dir graph)]
     (win/graph-has-other-windows? win dir)))
@@ -652,16 +601,15 @@
     nil))
 
 (defn open-new-window!
-  "Persist db first before calling! Or may break db persistency"
-  []
-  (let [win (win/create-main-window!)]
+  [repo]
+  (let [win (win/create-main-window! win/MAIN_WINDOW_ENTRY {:graph repo})]
     (win/on-close-actions! win close-watcher-when-orphaned!)
     (win/setup-window-listeners! win)
     win))
 
-(defmethod handle :openNewWindow [_window [_]]
+(defmethod handle :openNewWindow [_window [_ repo]]
   (logger/info ::open-new-window)
-  (open-new-window!)
+  (open-new-window! repo)
   nil)
 
 (defmethod handle :graphReady [window [_ graph-name]]
@@ -746,30 +694,6 @@
 
 (defmethod handle :default [args]
   (logger/error "Error: no ipc handler for:" args))
-
-(defn broadcast-persist-graph!
-  "Receive graph-name (not graph path)
-   Sends persist graph event to the renderer contains the target graph.
-   Returns a promise<void>."
-  [graph-name]
-  (p/create (fn [resolve _reject]
-              (let [graph-path (utils/get-graph-dir graph-name)
-                    windows (win/get-graph-all-windows graph-path)
-                    tar-graph-win (first windows)]
-                (if tar-graph-win
-                  ;; if no such graph, skip directly
-                  (do (state/set-state! :window/once-persist-done #(resolve nil))
-                      (utils/send-to-renderer tar-graph-win "persistGraph" graph-name))
-                  (resolve nil))))))
-
-(defmethod handle :broadcastPersistGraph [^js _win [_ graph-name]]
-  (broadcast-persist-graph! graph-name))
-
-(defmethod handle :broadcastPersistGraphDone [^js _win [_]]
-  ;; main process -> renderer doesn't support promise, so we use a global var to store the callback
-  (when-let [f (:window/once-persist-done @state/state)]
-    (f)
-    (state/set-state! :window/once-persist-done nil)))
 
 (defmethod handle :find-in-page [^js win [_ search option]]
   (find/find! win search (bean/->js option)))

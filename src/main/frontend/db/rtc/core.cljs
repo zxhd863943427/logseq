@@ -69,9 +69,12 @@
    [:toggle-auto-push-client-ops-chan :any]
    [:*auto-push-client-ops? :any]
    [:force-push-client-ops-chan :any]])
-(def state-validator (fn [data] (if ((m/validator state-schema) data)
-                                  true
-                                  (prn (mu/explain-data state-schema data)))))
+(def state-validator
+  (let [validator (m/validator state-schema)]
+    (fn [data]
+      (if (validator data)
+        true
+        (prn (mu/explain-data state-schema data))))))
 
 (def rtc-state-schema
   [:enum :open :closed])
@@ -139,7 +142,7 @@
         (prn :apply-remote-remove-ops (:block-uuid op))))))
 
 (defn- insert-or-move-block
-  [repo block-uuid remote-parents remote-left-uuid move?]
+  [repo block-uuid remote-parents remote-left-uuid move? op-value]
   (when (and (seq remote-parents) remote-left-uuid)
     (let [first-remote-parent (first remote-parents)
           local-parent (db/pull repo '[*] [:block/uuid first-remote-parent])
@@ -176,10 +179,22 @@
                           :block/format :markdown}]
                         local-parent {:sibling? false :keep-uuid? true}))
 
-        ([true true false] [true true true])
         ;; Don't need to insert-whiteboard-block here,
         ;; will do :upsert-whiteboard-block in `update-block-attrs`
-        nil
+        [true true false]
+        (when (nil? (:properties op-value))
+          ;; when :properties is nil, this block should be treat as normal block
+          (if move?
+            (transact-db! :move-blocks [b] local-parent false)
+            (transact-db! :insert-blocks [{:block/uuid block-uuid :block/content "" :block/format :markdown}]
+                          local-parent {:sibling? false :keep-uuid? true})))
+        [true true true]
+        (when (nil? (:properties op-value))
+          (let [sibling? (not= (:block/uuid local-parent) (:block/uuid local-left))]
+            (if move?
+              (transact-db! :move-blocks [b] local-left sibling?)
+              (transact-db! :insert-blocks [{:block/uuid block-uuid :block/content "" :block/format :markdown}]
+                            local-left {:sibling? sibling? :keep-uuid? true}))))
 
         (throw (ex-info "Don't know where to insert" {:block-uuid block-uuid :remote-parents remote-parents
                                                       :remote-left remote-left-uuid}))))))
@@ -244,7 +259,7 @@
         (transact-db! :upsert-whiteboard-block repo [(whiteboard-handler/shape->block shape page-name)])))))
 
 (defn- update-block-attrs
-  [repo block-uuid {:keys [parents] :as op-value}]
+  [repo block-uuid {:keys [parents properties _content] :as op-value}]
   (let [key-set (set/intersection
                  (conj rtc-const/general-attr-set :content)
                  (set (keys op-value)))]
@@ -252,9 +267,11 @@
       (let [first-remote-parent (first parents)
             local-parent (db/pull repo '[*] [:block/uuid first-remote-parent])
             whiteboard-page-block? (whiteboard-page-block? local-parent)]
-        (if whiteboard-page-block?
+        (cond
+          (and whiteboard-page-block? properties)
           (upsert-whiteboard-block repo op-value)
 
+          :else
           (let [b-ent (db/pull repo '[*] [:block/uuid block-uuid])
                 new-block
                 (cond-> (db/pull repo '[*] (:db/id b-ent))
@@ -272,7 +289,7 @@
                   (contains? key-set :tags)           (assoc :block/tags (some->> (seq (:tags op-value))
                                                                                   (map (partial vector :block/uuid))
                                                                                   (db/pull-many repo [:db/id])
-                                                                                  (keep :db/id)))
+                                                                                  (filter :db/id)))
                   ;; FIXME: it looks save-block won't save :block/properties??
                   ;;        so I need to transact properties myself
                   ;; (contains? key-set :properties)     (assoc :block/properties
@@ -293,9 +310,9 @@
     (let [r (check-block-pos repo self parents left)]
       (case r
         :not-exist
-        (insert-or-move-block repo self parents left false)
+        (insert-or-move-block repo self parents left false op-value)
         :wrong-pos
-        (insert-or-move-block repo self parents left true)
+        (insert-or-move-block repo self parents left true op-value)
         nil                             ; do nothing
         nil)
       (update-block-attrs repo self op-value)
@@ -310,9 +327,9 @@
       (let [r (check-block-pos repo self parents left)]
         (case r
           :not-exist
-          (insert-or-move-block repo self parents left false)
+          (insert-or-move-block repo self parents left false op-value)
           :wrong-pos
-          (insert-or-move-block repo self parents left true)
+          (insert-or-move-block repo self parents left true op-value)
           nil)))
     (update-block-attrs repo self op-value)
     (prn :apply-remote-update-ops self)))

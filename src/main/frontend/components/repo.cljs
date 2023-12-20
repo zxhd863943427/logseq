@@ -17,7 +17,9 @@
             [cljs.core.async :as async :refer [go <!]]
             [clojure.string :as string]
             [frontend.handler.file-sync :as file-sync]
-            [reitit.frontend.easy :as rfe]))
+            [reitit.frontend.easy :as rfe]
+            [frontend.handler.notification :as notification]
+            [frontend.util.fs :as fs-util]))
 
 (rum/defc normalized-graph-label
   [{:keys [url remote? GraphName GraphUUID] :as graph} on-click]
@@ -150,7 +152,7 @@
     (p/let [multiple-windows? (ipc/ipc "graphHasMultipleWindows" (state/get-current-repo))]
       (reset! (::electron-multiple-windows? state) multiple-windows?))))
 
-(defn- repos-dropdown-links [repos current-repo *multiple-windows?]
+(defn- repos-dropdown-links [repos current-repo *multiple-windows? & {:as opts}]
   (let [switch-repos (if-not (nil? current-repo)
                        (remove (fn [repo] (= current-repo (:url repo))) repos) repos) ; exclude current repo
         repo-links (mapv
@@ -171,6 +173,8 @@
                                                          (ui/icon "cloud" {:size 18})])]
                            :hover-detail repo-url ;; show full path on hover
                            :options      {:on-click (fn [e]
+                                                      (when-let [on-click (:on-click opts)]
+                                                        (on-click e))
                                                       (if (gobj/get e "shiftKey")
                                                         (state/pub-event! [:graph/open-new-window url])
                                                         (if (or local? db-only?)
@@ -188,14 +192,9 @@
         reindex-link {:title        (t :re-index)
                       :hover-detail (t :re-index-detail)
                       :options (cond->
-                                 {:on-click
-                                  (fn []
-                                    (state/pub-event! [:graph/ask-for-re-index *multiple-windows? nil]))})}
-        new-window-link (when (and (util/electron?)
-                                   ;; New Window button in menu bar of macOS is available.
-                                   (not util/mac?))
-                          {:title        (t :open-new-window)
-                           :options {:on-click #(state/pub-event! [:graph/open-new-window nil])}})]
+                                {:on-click
+                                 (fn []
+                                   (state/pub-event! [:graph/ask-for-re-index *multiple-windows? nil]))})}]
     (->>
      (concat repo-links
              [(when (seq repo-links) {:hr true})
@@ -204,17 +203,16 @@
                 {:title (t :new-graph) :options {:href (rfe/href :repos)}}) ;; Brings to the repos page for showing fallback message
               (when config/db-graph-enabled?
                 {:title (str (t :new-graph) " - DB version")
-                :options {:on-click #(state/pub-event! [:graph/new-db-graph])}})
+                 :options {:on-click #(state/pub-event! [:graph/new-db-graph])}})
               {:title (t :all-graphs) :options {:href (rfe/href :repos)}}
               refresh-link
               (when-not (config/db-based-graph? current-repo)
-                reindex-link)
-              new-window-link])
+                reindex-link)])
      (remove nil?))))
 
 (rum/defcs repos-dropdown < rum/reactive
   (rum/local false ::electron-multiple-windows?)
-  [state]
+  [state & {:as opts}]
   (let [multiple-windows? (::electron-multiple-windows? state)
         current-repo (state/sub :git/current-repo)
         login? (boolean (state/sub :auth/id-token))
@@ -224,7 +222,7 @@
             remotes (state/sub [:file-sync/remote-graphs :graphs])
             repos (if (and (seq remotes) login?)
                     (repo-handler/combine-local-&-remote-graphs repos remotes) repos)
-            links (repos-dropdown-links repos current-repo multiple-windows?)
+            links (repos-dropdown-links repos current-repo multiple-windows? opts)
             render-content (fn [{:keys [toggle-fn]}]
                              (let [remote? (:remote? (first (filter #(= current-repo (:url %)) repos)))
                                    repo-name (db/get-repo-name current-repo)
@@ -233,7 +231,7 @@
                                                      "Select a Graph")]
                                [:a.item.group.flex.items-center.p-2.text-sm.font-medium.rounded-md
 
-                                {:on-click (fn []
+                                {:on-click (fn [_e]
                                              (check-multiple-windows? state)
                                              (toggle-fn))
                                  :title    repo-name}       ;; show full path on hover
@@ -271,18 +269,35 @@
   (let [*graph-name (::graph-name state)
         new-db-f (fn []
                    (when-not (string/blank? @*graph-name)
-                     (repo-handler/new-db! @*graph-name)
-                     (state/close-modal!)))]
+                     (if (fs-util/include-reserved-chars? @*graph-name)
+                       (notification/show!
+                        [:div
+                         [:p "Graph name can't contain following reserved characters:"]
+                         [:ul
+                          [:li "< (less than)"]
+                          [:li "> (greater than)"]
+                          [:li ": (colon)"]
+                          [:li "\" (double quote)"]
+                          [:li "/ (forward slash)"]
+                          [:li "\\ (backslash)"]
+                          [:li "| (vertical bar or pipe)"]
+                          [:li "? (question mark)"]
+                          [:li "* (asterisk)"]
+                          [:li "# (hash)"]]]
+                        :warning false)
+                       (do
+                         (repo-handler/new-db! @*graph-name)
+                         (state/close-modal!)))))]
     [:div.new-graph.p-4
      [:h1.title "Create new graph: "]
      [:input.form-input.mb-4 {:value @*graph-name
                               :auto-focus true
                               :on-change #(reset! *graph-name (util/evalue %))
-                              :on-key-down   (fn [^js e]
-                                               (when (= (gobj/get e "key") "Enter")
-                                                 (new-db-f)))}]
+                              :on-key-down (fn [^js e]
+                                             (when (= (gobj/get e "key") "Enter")
+                                               (new-db-f)))}]
      (ui/button "Submit"
-       :on-click new-db-f
-       :on-key-down   (fn [^js e]
-                        (when (= (gobj/get e "key") "Enter")
-                          (new-db-f))))]))
+                :on-click new-db-f
+                :on-key-down   (fn [^js e]
+                                 (when (= (gobj/get e "key") "Enter")
+                                   (new-db-f))))]))
